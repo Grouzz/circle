@@ -1,154 +1,220 @@
-import socket
+import pygame
 import multiprocessing
 from multiprocessing import shared_memory
-import random
-import struct
 import time
+from queue import Empty
+import sys
 import env
+import animals
 
-class Animal:
-    """for predator and prey"""
-    def __init__(self, species_type, grid_lock):
-        self.species = species_type
-        self.energy = env.energy_start
-        self.pos_idx = -1
-        self.lock = grid_lock
+
+#ui conf
+grid_pixel_size = env.tab_size * env.cell_size
+window_width = grid_pixel_size
+window_height = grid_pixel_size + 100 #extra space for text
+FPS = 30
+
+#colors
+bg_color = (30, 20, 40)
+grid_color = (25, 50, 70)
+text_color = (200, 230, 255)
+
+class Display:
+    def __init__(self, cmd_queue, display_queue):
+        pygame.init()
+        self.screen = pygame.display.set_mode((window_width, window_height))  #screen creation
+        pygame.display.set_caption("circle of life") #screen title
+        self.clock = pygame.time.Clock()
         self.running = True
+        
+        #queues for comm
+        self.cmd_queue = cmd_queue #sending the comms to env
+        self.display_queue = display_queue  #receiving frames from env
+        
+        #actual state of the game
+        self.grid_data = bytes([env.empty] * env.number_bytes)
+        self.counts = {'grass': 0, 'passive_prey': 0, 'active_prey': 0, 'predator': 0} #counter
+        self.raining = False
+        self.drought = False
+        
+        #fonts definition
+        self.font = pygame.font.SysFont("Times New Roman", 16, bold=True)
+        self.font_small = pygame.font.SysFont("Times New Roman", 14)
+        
+        #loading the assets
+        self.images = {}
+        self.load_asset(env.grass, "grass.png", (34, 139, 34))
+        self.load_asset(env.passive_prey, "prey.png", (200, 200, 200))
+        self.load_asset(env.active_prey, "prey_active.png", (255, 255, 0))
+        self.load_asset(env.predator, "predator.png", (220, 20, 60))
+
+    def load_asset(self, key, path, color):
+        """load image or create colored squares if it doesn"t load as expected"""
+        try:
+            img = pygame.image.load(path) #loading img into memory
+            self.images[key] = pygame.transform.scale(img, (env.cell_size, env.cell_size)) #resizing the image to the actual size of the cells + saving
+        except:
+            surf = pygame.Surface((env.cell_size, env.cell_size))
+            surf.fill(color)
+            pygame.draw.rect(surf, (0, 0, 0), surf.get_rect(), 1) #drawing a border in black
+            self.images[key] = surf #saving
 
     def run(self):
-        """Main lifecycle of an animal"""
-        #connectingto env
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((env.HOST, env.PORT))
-            data = sock.recv(4)
-            if not data:
-                return
-            self.pos_idx = struct.unpack('I', data)[0]
-            sock.close()
-        except Exception as e:
-            print(f"<ANIMAL> failed to connect: {e}")
-            return
-
-        #shared mem
-        try:
-            shm = shared_memory.SharedMemory(name=env.shared_mem_name)
-            grid = shm.buf
-        except FileNotFoundError:
-            print("<ANIMAL> shared mem not found")
-            return
-
-        #placing self on grid
-        with self.lock:
-            if grid[self.pos_idx] == env.empty:
-                grid[self.pos_idx] = self.species
-            else:
-                shm.close()
-                return
-
-        while self.running:
-            time.sleep(random.uniform(0.5, 1.5)) #slowmotion for visibility
-            self.energy -= env.cost_move #losing energy if movement
-            
-            #die if no energy
-            if self.energy <= 0:
-                self.die(grid)
-                break
-
-            #checking if self still alive
-            current = grid[self.pos_idx]
-            if self.species == env.predator:
-                if current != env.predator:
-                    break
-            else:
-                if current not in [env.passive_prey, env.active_prey]:
-                    break
-
-            #is it hungry
-            is_active = self.energy < env.h_lim
-            
-            #updating prey visual state
-            if self.species in [env.passive_prey, env.active_prey]:
-                new_code = env.active_prey if is_active else env.passive_prey
-                with self.lock:
-                    if grid[self.pos_idx] in [env.passive_prey, env.active_prey]:
-                        grid[self.pos_idx] = new_code
-            
-            self.move_and_eat(grid, is_active) #moving and try to eat
-
-            #reproductionif enough energy
-            if self.energy > env.r_lim:
-                self.reproduce()
-                self.energy -= 60
-
-        shm.close()
-
-    def die(self, grid):
-        """removing from grid"""
-        with self.lock:
-            if grid[self.pos_idx] in [env.passive_prey, env.active_prey, env.predator]:
-                grid[self.pos_idx] = env.empty
-
-    def reproduce(self):
-        """spawning a child animal"""
-        child_type = env.passive_prey if self.species != env.predator else env.predator
-        p = multiprocessing.Process(target=run_animal, args=(child_type, self.lock), daemon=True)
-        p.start()
-
-    def get_neighbors(self):
-        """get list of neighboring cell indices"""
-        row = self.pos_idx // env.tab_size
-        col = self.pos_idx % env.tab_size
-        neighbors = []
-        legal_moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-        for dr, dc in legal_moves:
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < env.tab_size and 0 <= nc < env.tab_size:
-                neighbors.append(nr * env.tab_size + nc)
-        return neighbors
-
-    def move_and_eat(self, grid, is_active):
-        """moving to neighbor and eat (if possible ofc)"""
-        neighbors = self.get_neighbors()
-        random.shuffle(neighbors)
-        target = -1
+        """main display loop"""
+        print("<DISPLAY> starting...")
         
-        with self.lock:
-            for n_idx in neighbors:
-                content = grid[n_idx]
-                if self.species in [env.passive_prey, env.active_prey]:
-                    #prey eats grass when active
-                    if is_active and content == env.grass:
-                        self.energy = min(env.energy_max, self.energy +env.food_gain)
-                        target = n_idx
-                        break
-                    elif content == env.empty:
-                        target = n_idx
+        while self.running:
+            #handling events
+            for event in pygame.event.get(): #events : mouse click or pressing some keys
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    self.cmd_queue.put("quit") #stopping the simulation
                 
-                elif self.species == env.predator:
-                    #predator eats active prey when hungry
-                    if is_active and content == env.active_prey:
-                        self.energy = min(env.energy_max, self.energy+ env.food_gain)
-                        target = n_idx
-                        break
-                    elif content == env.empty:
-                        target = n_idx
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.running = False
+                        self.cmd_queue.put("quit")
+                    
+                    elif event.key == pygame.K_SPACE:
+                        #drought on/off
+                        self.cmd_queue.put("drought")
+                    
+                    elif event.key == pygame.K_r:
+                        #rain on/off
+                        self.cmd_queue.put("rain")
+            
+            #updating the data on the display
+            try:
+                while True:
+                    frame_latest = self.display_queue.get_nowait() #get item: if empty-> it crashes
+                    self.grid_data = frame_latest['grid'] #updating data (no previous crash)
+                    self.counts = frame_latest['counts']
+                    self.raining = frame_latest['raining']
+                    self.drought = frame_latest['drought']
+            except Empty: #if the crash was cause by an empty queue
+                pass #we continue
 
-            #executing the move that we've found
-            if target != -1:
-                if self.species in [env.passive_prey, env.active_prey]:
-                    vis = env.active_prey if is_active else env.passive_prey
-                else:
-                    vis = self.species
-                
-                #move
-                grid[self.pos_idx] = env.empty
-                self.pos_idx = target
-                grid[self.pos_idx] = vis
+            #drawing
+            self.draw_grid()
+            self.draw_ui()
+            
+            pygame.display.flip() #flipping the buffer: taking everything in the buffer and showing it onto the screen
+            self.clock.tick(FPS) #if loop is fast, we cap the execution with a delay
+
+        pygame.quit()
+
+    def draw_grid(self):
+        """drawing the grid"""
+        self.screen.fill(bg_color) #filling with background color
+        
+        for i in range(env.number_bytes):
+            val = self.grid_data[i] #wholives there
+
+            #calculating 2D position with 1D
+            x = (i % env.tab_size) * env.cell_size
+            y = (i // env.tab_size) * env.cell_size
+
+            #drawing
+            if val in self.images:
+                self.screen.blit(self.images[val], (x, y))
+            
+            #grid lines
+            pygame.draw.rect(self.screen, grid_color, (x, y, env.cell_size, env.cell_size), 1) #1 is thickness
+
+    def draw_ui(self):
+        """drawing the status panel"""
+        y_offset = env.tab_size * env.cell_size #starting position for the panel, where the grid ends
+        
+        #filling with background color
+        pygame.draw.rect(self.screen, (20, 20, 20), (0, y_offset, window_width, 100))
+        
+        if self.drought:
+            status_text = "status: drought -> no grass growth right now"
+            status_color = (255, 100, 100)
+        elif self.raining:
+            status_text = "status: raining -> fast grass growth"
+            status_color = (100, 200, 255)
+        else:
+            status_text = "status: normal"
+            status_color = (200, 255, 200)
+        
+        surf_status = self.font.render(status_text, True, status_color) #rendering the text
+        self.screen.blit(surf_status, (10, y_offset + 10)) #pushing the text-image
+        
+        #counting
+        total_prey = self.counts['passive_prey'] + self.counts['active_prey']
+        pop_text = (f"grass: {self.counts['grass']}  |  " f"prey: {total_prey}  |  " f"predators: {self.counts['predator']}")
+        surf_pop = self.font_small.render(pop_text, True, (200, 200, 200))
+        self.screen.blit(surf_pop, (10, y_offset + 40))
+        
+        # Controls
+        controls = "<SPACE> toggle drought  |  <R> toggle rain  |  <ESC> QUIT"
+        surf_controls = self.font_small.render(controls, True, (150, 150, 150))
+        self.screen.blit(surf_controls, (10, y_offset + 65))
 
 
-def run_animal(species, lock):
-    """function to create and run an animal"""
-    a = Animal(species, lock)
-    a.run()
+def main(): 
+    print("Circle game")
+    print("-" * 40)
+    print()
+
+    #sync
+    grid_lock = multiprocessing.Lock() #mutual exclusion lock creation
+    cmd_queue = multiprocessing.Queue() # display-> env
+    display_queue = multiprocessing.Queue()  # env ->display
+
+    #env process
+    env_proc = env.EnvProcess(grid_lock) #lock to env
+    p_env = multiprocessing.Process(target=env_proc.run, args=(cmd_queue, display_queue), daemon=True) #daemon=True for child process, ends when parent process ends
+    p_env.start()
+    
+    #waiting for shared_mem
+    time.sleep(1)
+
+    #initial population
+    print("spawning initial population...")
+    procs = []
+    
+    #preys
+    for _ in range(20):
+        p = multiprocessing.Process(target=animals.run_animal, args=(env.passive_prey, grid_lock), daemon=True)
+        p.start()
+        procs.append(p)
+
+    #predators
+    for _ in range(6):
+        p = multiprocessing.Process(target=animals.run_animal, args=(env.predator, grid_lock), daemon=True)
+        p.start()
+        procs.append(p)
+
+    print(f"started {len(procs)} animals")
+    print("\ndisplay charging...")
+
+    #running display in the main process(required by pygame)
+    display = Display(cmd_queue, display_queue)
+    try:
+        display.run() #staying here until player quits
+    
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        print("\nshutting down the game and cleaning...")
+        p_env.terminate()
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        
+        #cleanup
+        try:
+            s = shared_memory.SharedMemory(name=env.shared_mem_name)
+            s.close()
+            s.unlink()
+        except:
+            pass
+        print("cleanup complete")
+        sys.exit()
+
+
+if __name__ == "__main__":
+    main()
